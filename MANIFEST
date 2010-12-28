@@ -1,0 +1,17 @@
+Build.PL
+Changes
+lib/Role/Basic.pm
+MANIFEST
+README
+t/00-load.t
+t/basic.t
+t/composition.t
+t/exceptions.t
+t/internals.t
+t/lib/My/Does/Basic.pm
+t/lib/My/Example.pm
+xt/manifest.t
+xt/pod-coverage.t
+xt/pod.t
+Makefile.PL
+META.yml
