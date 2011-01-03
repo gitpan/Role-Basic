@@ -8,11 +8,9 @@ use warnings FATAL => 'all';
 use B qw/svref_2object/;
 use Carp ();
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
-my %IS_ROLE;
-my %REQUIRED_BY;
-my %HAS_ROLES;
+my ( %IS_ROLE, %REQUIRED_BY, %HAS_ROLES );
 
 sub import {
     my $class  = shift;
@@ -62,8 +60,7 @@ sub apply_roles_to_package {
         Carp::confess("with() may not be called more than once for $target");
     }
 
-    my %provided_by;
-    my %requires;
+    my ( %provided_by, %requires );
     my $target_methods = $class->_get_methods($target);
     while ( my $role = shift @roles ) {
 
@@ -94,8 +91,8 @@ sub apply_roles_to_package {
         if ( $IS_ROLE{$target} ) {
             $class->add_to_requirements( $target, @{ $REQUIRED_BY{$role} } );
         }
-        foreach my $method (@$role_methods) {
-            push @{ $provided_by{$method} } => $role;
+        while ( my ( $method, $data ) = each %$role_methods ) {
+            push @{ $provided_by{$method} } => $data;
         }
     }
 
@@ -103,14 +100,21 @@ sub apply_roles_to_package {
     $class->_check_requirements( $target, \%requires );
 }
 
+# XXX no dependencies if we can avoid it, thank you
+sub _uniq (@) {
+    my %seen = ();
+    grep { not $seen{$_}++ } @_;
+}
+
 sub _check_conflicts {
     my ( $class, $target, $provided_by ) = @_;
     my @errors;
     while ( my ( $method, $roles ) = each %$provided_by ) {
-        if ( @$roles > 1 ) {
-            my $roles = join " and " => @$roles;
+        my @sources = _uniq map { $_->{source} } @$roles;
+        if ( @sources > 1 ) {
+            my $sources = join " and " => @sources;
             push @errors =>
-"Due to method name conflicts in $roles, the method '$method' must be included or excluded in $target";
+"Due to method name conflicts in $sources, the method '$method' must be included or excluded in $target";
         }
     }
     if ( my $errors = join "\n" => @errors ) {
@@ -173,8 +177,6 @@ sub _add_role_methods_to_target {
         Carp::confess("Unknown arguments in 'with()' statement for $role");
     }
 
-    # XXX Apply roles to roles!
-
     foreach my $method ( keys %$code_for ) {
         if ( $is_excluded{$method} ) {
             delete $code_for->{$method};
@@ -198,9 +200,9 @@ sub _add_role_methods_to_target {
 
         # XXX we're going to handle this ourselves
         no warnings 'redefine';
-        *{"${target}::$method"} = $code_for->{$method};
+        *{"${target}::$method"} = $code_for->{$method}{code};
     }
-    return [ keys %$code_for ];
+    return $code_for;
 }
 
 sub _get_methods {
@@ -213,7 +215,7 @@ sub _get_methods {
         local $_ = $_;
         my $code = *$_{CODE};
         s/^\*$target\:://;
-        $_ => $code
+        $_ => { code => $code, source => _sub_package($code) }
       }
       grep {
         !( ref eq 'SCALAR' )    # not a scalar
@@ -297,7 +299,7 @@ Role::Basic - Just roles. Nothing else.
 
 =head1 VERSION
 
-Version 0.03
+Version 0.04
 
 =head1 SYNOPSIS
 
