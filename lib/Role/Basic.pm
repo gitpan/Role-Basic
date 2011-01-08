@@ -8,9 +8,9 @@ use warnings FATAL => 'all';
 use B qw/svref_2object/;
 use Carp ();
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
-my ( %IS_ROLE, %REQUIRED_BY, %HAS_ROLES, %ROLE_ALLOWS );
+my ( %IS_ROLE, %REQUIRED_BY, %HAS_ROLES, %ROLE_ALLOWS, %ALLOWED_BY );
 
 sub import {
     my $class  = shift;
@@ -34,7 +34,9 @@ sub import {
     elsif ( 2 == @_ && 'allow' eq $_[0] ) {
 
         # this is a role which allows methods from a foreign class
-        $ROLE_ALLOWS{$target} = $_[1];
+        my $foreign_class = $_[1];
+        $ROLE_ALLOWS{$target} = $foreign_class;
+        push @{ $ALLOWED_BY{$foreign_class} } => $target;
         $class->_declare_role($target);
     }
     elsif (@_) {
@@ -65,6 +67,22 @@ sub add_to_requirements {
       grep { not $seen{$_}++ } @{ $REQUIRED_BY{$role} };
 }
 
+sub get_requirements {
+    my ( $class, $role ) = @_;
+    return unless my $requirements = $REQUIRED_BY{$role};
+    return @$requirements;
+}
+
+sub _roles {
+    my ( $class, $target ) = @_;
+    return unless $HAS_ROLES{$target};
+    my @roles;
+    foreach my $role ( keys %{ $HAS_ROLES{$target} } ) {
+        push @roles => $role, $class->_roles($role);
+    }
+    return @roles;
+}
+
 sub apply_roles_to_package {
     my ( $class, $target, @roles ) = @_;
     if ( $HAS_ROLES{$target} ) {
@@ -72,7 +90,6 @@ sub apply_roles_to_package {
     }
 
     my ( %provided_by, %requires );
-    my $target_methods = $class->_get_methods($target);
     while ( my $role = shift @roles ) {
 
         # will need to verify that they're actually a role!
@@ -81,26 +98,26 @@ sub apply_roles_to_package {
         $class->_load_role($role);
 
         # XXX this is awful. Don't tell anyone I wrote this
+        $HAS_ROLES{$target}{$role} = 1;
         my $role_methods = $class->_add_role_methods_to_target( 
             $role,
             $target,
-            $target_methods,
             $conflict_handlers
         );
-        $HAS_ROLES{$target}{$role} = 1;
-        if ( my $roles = $HAS_ROLES{$role}) {
-            foreach my $role (keys %$roles) {
+        if ( my $roles = $HAS_ROLES{$role} ) {
+            foreach my $role ( keys %$roles ) {
                 $HAS_ROLES{$target}{$role} = 1;
             }
         }
 
-        foreach my $method ( @{ $REQUIRED_BY{$role} } ) {
+        foreach my $method ( $class->get_requirements($role) ) {
             push @{ $requires{$method} } => $role;
         }
 
         # roles consuming roles should have the same requirements.
         if ( $IS_ROLE{$target} ) {
-            $class->add_to_requirements( $target, @{ $REQUIRED_BY{$role} } );
+            $class->add_to_requirements( $target,
+                $class->get_requirements($role) );
         }
         while ( my ( $method, $data ) = each %$role_methods ) {
             push @{ $provided_by{$method} } => $data;
@@ -153,8 +170,10 @@ sub _check_requirements {
 }
 
 sub _add_role_methods_to_target {
-    my ( $class, $role, $target, $target_methods, $conflict_handlers ) = @_;
-    my $code_for = $class->_get_methods($role);
+    my ( $class, $role, $target, $conflict_handlers ) = @_;
+
+    my $target_methods = $class->_get_methods($target);
+    my $code_for       = $class->_get_methods($role);
 
     # figure out which methods to exclude
     my $excludes = delete $conflict_handlers->{'-excludes'} || [];
@@ -193,7 +212,6 @@ sub _add_role_methods_to_target {
             delete $code_for->{$method};
             next;
         }
-        no strict 'refs';
 
         if ( exists $target_methods->{$method} ) {
             if ( $ENV{PERL_ROLE_OVERRIDE_DIE} ) {
@@ -210,12 +228,14 @@ sub _add_role_methods_to_target {
         }
 
         # XXX we're going to handle this ourselves
+        no strict 'refs';
         no warnings 'redefine';
         *{"${target}::$method"} = $code_for->{$method}{code};
     }
     return $code_for;
 }
 
+# We can cache this at some point, but for now, the return value is munged
 sub _get_methods {
     my ( $class, $target ) = @_;
 
@@ -239,42 +259,45 @@ sub _get_methods {
 sub _is_valid_method {
     my ( $target, $code ) = @_;
 
-    my $source = _sub_package($code);
+    my $source = _sub_package($code) or return;
 
     # XXX There's a potential bug where some idiot could use Role::Basic to
     # create exportable functions and those get exported into a role. That's
     # far-fetched enough that I'm not worried about it.
-    return
-
-      # no imported methods
+    my $is_valid =
+      # declared in package, not imported
       $target eq $source
-
       ||
-
-      # unless it's a role and 'allows' another class
-      ( exists $ROLE_ALLOWS{$target} && $ROLE_ALLOWS{$target} eq $source )
-
-      ||
-
       # unless we're a role and they're composed from another role
       $IS_ROLE{$target} && $IS_ROLE{$source};
+    
+    unless ($is_valid) {
+        foreach my $role (@{ $ALLOWED_BY{$source} }) {
+            return 1 if $target->DOES($role);
+        }
+        return 1
+          if exists $ROLE_ALLOWS{$target} && $ROLE_ALLOWS{$target} eq $source;
+    }
+    return $is_valid;
+
 }
 
 sub _sub_package {
-    my $package;
+    my ($code) = @_;
+    my $source_package;
     eval {
-        my $stash = svref_2object(shift)->STASH;
+        my $stash = svref_2object($code)->STASH;
         if ( $stash && $stash->can('NAME') ) {
-            $package = $stash->NAME;
+            $source_package = $stash->NAME;
         }
         else {
-            $package = '';
+            $source_package = '';
         }
     };
     if ( my $error = $@ ) {
-        warn "Could not determine calling package: $error";
+        warn "Could not determine calling source_package: $error";
     }
-    return $package || '';
+    return $source_package || '';
 }
 
 sub _load_role {
@@ -308,7 +331,7 @@ Role::Basic - Just roles. Nothing else.
 
 =head1 VERSION
 
-Version 0.06
+Version 0.07
 
 =head1 SYNOPSIS
 
@@ -336,6 +359,11 @@ In your class:
     );
 
     sub as_hash { ... } # because the role requires it
+
+=head1 ALPHA CODE
+
+This code should not be considered production ready. The basic features are
+there, but a few issues are still being fleshed out.
 
 =head1 DESCRIPTION
 
@@ -380,6 +408,9 @@ roles. Thus:
     sub some_method {...} # this will be provided by the role
 
 =head2 Allowed methods in roles
+
+B<Warning>: this functionality is experimental and is subject to change with
+no warning.
 
 As mentioned, methods imported into a role are not provided by that role.
 However, this can make it very hard when you want to provide simple
