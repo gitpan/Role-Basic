@@ -6,11 +6,14 @@ use strict;
 use warnings FATAL => 'all';
 
 use B qw/svref_2object/;
+use Storable ();
 use Carp ();
+use Data::Dumper ();
 
-our $VERSION = '0.0701';
+our $VERSION = '0.08';
 
-my ( %IS_ROLE, %REQUIRED_BY, %HAS_ROLES, %ROLE_ALLOWS, %ALLOWED_BY );
+# eventually clean these up
+my ( %IS_ROLE, %REQUIRED_BY, %HAS_ROLES, %ALLOWED_BY, %PROVIDES );
 
 sub import {
     my $class  = shift;
@@ -23,8 +26,9 @@ sub import {
     # everybody gets 'with' and 'DOES'
     *{ _getglob "${target}::DOES" } = sub {
         my ( $proto, $role ) = @_;
-        my $class = ref $proto || $proto;
-        return $HAS_ROLES{$class}{$role};
+        my $class_or_role = ref $proto || $proto;
+        return 1 if $class_or_role eq $role;
+        return exists $HAS_ROLES{$class_or_role}{$role} ? 1 : 0;
     };
     if ( 1 == @_ && 'with' eq $_[0] ) {
 
@@ -35,7 +39,6 @@ sub import {
 
         # this is a role which allows methods from a foreign class
         my $foreign_class = $_[1];
-        $ROLE_ALLOWS{$target} = $foreign_class;
         push @{ $ALLOWED_BY{$foreign_class} } => $target;
         $class->_declare_role($target);
     }
@@ -67,60 +70,107 @@ sub add_to_requirements {
       grep { not $seen{$_}++ } @{ $REQUIRED_BY{$role} };
 }
 
-sub get_requirements {
+sub get_required_by {
     my ( $class, $role ) = @_;
     return unless my $requirements = $REQUIRED_BY{$role};
     return @$requirements;
+}
+
+sub requires_method {
+    my ( $class, $role, $method ) = @_;
+    return unless $IS_ROLE{$role};
+    my %requires = map { $_ => 1 } $class->get_required_by($role);
+    return $requires{$method};
 }
 
 sub _roles {
     my ( $class, $target ) = @_;
     return unless $HAS_ROLES{$target};
     my @roles;
+    my %seen;
     foreach my $role ( keys %{ $HAS_ROLES{$target} } ) {
-        push @roles => $role, $class->_roles($role);
+        my $modifiers = $HAS_ROLES{$target}{$role};
+        my $role_name = $class->_get_role_name($role,$modifiers);
+        unless ( $seen{$role_name} ) {
+            push @roles => $role_name, $class->_roles($role);
+        }
     }
     return @roles;
 }
 
 sub apply_roles_to_package {
     my ( $class, $target, @roles ) = @_;
+
     if ( $HAS_ROLES{$target} ) {
         Carp::confess("with() may not be called more than once for $target");
     }
 
     my ( %provided_by, %requires );
+
+    my %is_applied;
+
+    # these are roles which a class does not use directly, but are contained in
+    # the roles the class consumes.
+    my %contained_roles;
+
     while ( my $role = shift @roles ) {
 
         # will need to verify that they're actually a role!
 
-        my $conflict_handlers = shift @roles if ref $roles[0];
-        $class->_load_role($role);
+        my $role_modifiers = shift @roles if ref $roles[0];
+        $role_modifiers ||= {};
+        my $role_name = $class->_get_role_name( $role, $role_modifiers );
+        $is_applied{$role_name} = 1;
+        $class->_load_role( $role, $role_modifiers->{'-version'} );
 
         # XXX this is awful. Don't tell anyone I wrote this
-        $HAS_ROLES{$target}{$role} = 1;
         my $role_methods = $class->_add_role_methods_to_target( 
             $role,
             $target,
-            $conflict_handlers
+            $role_modifiers
         );
+
+        # DOES() in some cases
         if ( my $roles = $HAS_ROLES{$role} ) {
             foreach my $role ( keys %$roles ) {
-                $HAS_ROLES{$target}{$role} = 1;
+                $HAS_ROLES{$target}{$role} = $roles->{$role};
             }
         }
 
-        foreach my $method ( $class->get_requirements($role) ) {
+        foreach my $method ( $class->get_required_by($role) ) {
             push @{ $requires{$method} } => $role;
         }
 
         # roles consuming roles should have the same requirements.
         if ( $IS_ROLE{$target} ) {
             $class->add_to_requirements( $target,
-                $class->get_requirements($role) );
+                $class->get_required_by($role) );
         }
+
         while ( my ( $method, $data ) = each %$role_methods ) {
-            push @{ $provided_by{$method} } => $data;
+            $PROVIDES{$role_name}{$method} ||= $data;
+        }
+
+        # any extra roles contained in applied roles must be added
+        # (helps with conflict resolution)
+        $contained_roles{$role_name} = 1;
+        foreach my $contained_role ( $class->_roles($role) ) {
+            next if $is_applied{$contained_role};
+            $contained_roles{$contained_role} = 1;
+            $is_applied{$contained_role}      = 1;
+        }
+    }
+    foreach my $contained_role (keys %contained_roles) {
+        my ( $role, $modifiers ) = split /-/ => $contained_role, 2;
+        foreach my $method ( $class->get_required_by($role) ) {
+            push @{ $requires{$method} } => $role;
+        }
+        # a role is not a name. A role is a role plus its alias/exclusion. We
+        # now store those in $HAS_ROLE so pull from them
+        if ( my $methods = $PROVIDES{$contained_role} ) {
+            foreach my $method (keys %$methods) {
+                push @{ $provided_by{$method} } => $methods->{$method};
+            }
         }
     }
 
@@ -128,7 +178,6 @@ sub apply_roles_to_package {
     $class->_check_requirements( $target, \%requires );
 }
 
-# XXX no dependencies if we can avoid it, thank you
 sub _uniq (@) {
     my %seen = ();
     grep { not $seen{$_}++ } @_;
@@ -137,12 +186,28 @@ sub _uniq (@) {
 sub _check_conflicts {
     my ( $class, $target, $provided_by ) = @_;
     my @errors;
-    while ( my ( $method, $roles ) = each %$provided_by ) {
-        my @sources = _uniq map { $_->{source} } @$roles;
-        if ( @sources > 1 ) {
-            my $sources = join " and " => @sources;
+    foreach my $method (keys %$provided_by) {
+        my $sources = $provided_by->{$method};
+        next if 1 == @$sources;
+
+        my %seen;
+        # what we're doing here is checking to see if code references point to
+        # the same reference. If they do, they can't possibly be in conflict
+        # because they're the same method. This seems strange, but it does
+        # follow the original spec.
+        my @sources = do {
+            no warnings 'uninitialized';
+            map    { $_->{source} }
+              grep { !$seen{ $_->{code} }++ } @$sources;
+        };
+
+        # more than one role provides the method and it's not overridden by
+        # the consuming class having that method
+        if ( @sources > 1 && $target ne _sub_package( $target->can($method) ) )
+        {
+            my $sources = join "' and '" => sort @sources;
             push @errors =>
-"Due to method name conflicts in $sources, the method '$method' must be included or excluded in $target";
+"Due to a method name conflict in roles '$sources', the method '$method' must be implemented or excluded by '$target'";
         }
     }
     if ( my $errors = join "\n" => @errors ) {
@@ -159,7 +224,7 @@ sub _check_requirements {
     my @errors;
     foreach my $method ( keys %$requires ) {
         unless ( $target->can($method) ) {
-            my $roles = join '|' => @{ $requires->{$method} };
+            my $roles = join '|' => _uniq sort @{ $requires->{$method} };
             push @errors =>
 "'$roles' requires the method '$method' to be implemented by '$target'";
         }
@@ -169,47 +234,53 @@ sub _check_requirements {
     }
 }
 
+sub _get_role_name {
+    my ( $class, $role, $modifiers ) = @_;
+    local $Data::Dumper::Indent   = 0;
+    local $Data::Dumper::Terse    = 1;
+    local $Data::Dumper::Sortkeys = 1;
+    return "$role-" . Data::Dumper::Dumper($modifiers);
+}
+
 sub _add_role_methods_to_target {
-    my ( $class, $role, $target, $conflict_handlers ) = @_;
+    my ( $class, $role, $target, $role_modifiers) = @_;
+
+    my $copied_modifiers = Storable::dclone($role_modifiers);
+    my $role_name = $class->_get_role_name( $role, $copied_modifiers );
 
     my $target_methods = $class->_get_methods($target);
-    my $code_for       = $class->_get_methods($role);
+    my $is_loaded      = $PROVIDES{$role_name};
+    my $code_for       = $is_loaded || $class->_get_methods($role);
 
-    # figure out which methods to exclude
-    my $excludes = delete $conflict_handlers->{'-excludes'} || [];
-    $excludes = [$excludes] unless ref $excludes;
-    unless ( 'ARRAY' eq ref $excludes ) {
-        Carp::confess(
-"Argument to '-excludes' in package $target must be a scalar or array reference"
-        );
-    }
-    my %is_excluded = map { $_ => 1 } @$excludes;
+    delete $role_modifiers->{'-version'};
+    my ( $is_excluded, $aliases ) =
+      $class->_get_excludes_and_aliases( $target, $role, $role_modifiers );
 
-    # rename methods to alias
-    my $aliases = delete $conflict_handlers->{'-alias'};
-    $aliases ||= {};
-    unless ( 'HASH' eq ref $aliases ) {
-        Carp::confess(
-            "Argument to '-alias' in package $target must be a hash reference"
-        );
-    }
+    my $stash = do { no strict 'refs'; \%{"${target}::"} };
     while ( my ( $old_method, $new_method ) = each %$aliases ) {
-        if ( exists $code_for->{$new_method} ) {
-            Carp::confess(
-"Cannot alias '$old_method' to existing method '$new_method' in $role"
-            );
+        if ( !$is_loaded ) {
+            if ( exists $code_for->{$new_method} ) {
+                Carp::confess(
+    "Cannot alias '$old_method' to existing method '$new_method' in $role"
+                );
+            }
+            else {
+                $code_for->{$new_method} = $code_for->{$old_method};
+            }
         }
-        else {
-            $code_for->{$new_method} = delete $code_for->{$old_method};
+
+        # We do this because $target->can($new_method) wouldn't be appropriate
+        # since it's OK for a role method to -alias over an inherited one. You
+        # can -alias directly on top of an existing method, though.
+        if ( exists $stash->{$new_method} ) {
+            Carp::confess("Cannot alias '$old_method' to '$new_method' as a method of that name already exists in $target");
         }
-    }
-    if ( my $unknown = join ', ' => keys %$conflict_handlers ) {
-        Carp::confess("Unknown arguments in 'with()' statement for $role");
     }
 
     foreach my $method ( keys %$code_for ) {
-        if ( $is_excluded{$method} ) {
+        if ( $is_excluded->{$method} ) {
             delete $code_for->{$method};
+            $class->add_to_requirements( $target, $method );
             next;
         }
 
@@ -226,13 +297,47 @@ sub _add_role_methods_to_target {
             }
             next;
         }
-
         # XXX we're going to handle this ourselves
         no strict 'refs';
         no warnings 'redefine';
         *{"${target}::$method"} = $code_for->{$method}{code};
     }
+    $HAS_ROLES{$target}{$role} = $copied_modifiers;
     return $code_for;
+}
+
+sub _get_excludes_and_aliases {
+    my ( $class, $target, $role, $role_modifiers ) = @_;
+    # figure out which methods to exclude
+    my $excludes = delete $role_modifiers->{'-excludes'} || [];
+    my $aliases  = delete $role_modifiers->{'-alias'}    || {};
+    my $renames  = delete $role_modifiers->{'-rename'}   || {};
+
+    $excludes = [$excludes] unless ref $excludes;
+    my %is_excluded = map { $_ => 1 } @$excludes;
+
+    while ( my ( $old_method, $new_method ) = each %$renames ) {
+        $is_excluded{$old_method} = 1;
+        $aliases->{$old_method} = $new_method;
+    }
+
+    unless ( 'ARRAY' eq ref $excludes ) {
+        Carp::confess(
+"Argument to '-excludes' in package $target must be a scalar or array reference"
+        );
+    }
+
+    # rename methods to alias
+    unless ( 'HASH' eq ref $aliases ) {
+        Carp::confess(
+            "Argument to '-alias' in package $target must be a hash reference"
+        );
+    }
+
+    if ( my $unknown = join ', ' => keys %$role_modifiers ) {
+        Carp::confess("Unknown arguments in 'with()' statement for $role");
+    }
+    return ( \%is_excluded, $aliases );
 }
 
 # We can cache this at some point, but for now, the return value is munged
@@ -241,23 +346,27 @@ sub _get_methods {
 
     my $stash = do { no strict 'refs'; \%{"${target}::"} };
 
-    my %methods =
-      map {
-        local $_ = $_;
-        my $code = *$_{CODE};
-        s/^\*$target\:://;
-        $_ => { code => $code, source => _sub_package($code) }
-      }
-      grep {
-        !( ref eq 'SCALAR' )    # not a scalar
-          && *$_{CODE}          # actually have code
-          && _is_valid_method( $target, *$_{CODE} )
-      } values %$stash;
+    my %methods;
+    foreach my $item ( values %$stash ) {
+
+        next unless my $code = _get_valid_method( $target, $item );
+
+        # this prevents a "modification of read-only value" error.
+        my $name = $item;
+        $name =~ s/^\*$target\:://;
+        my $source = _sub_package($code);
+        $methods{$name} = {
+            code   => $code,
+            source => $source,
+        };
+    }
     return \%methods;
 }
 
-sub _is_valid_method {
-    my ( $target, $code ) = @_;
+sub _get_valid_method {
+    my ( $target, $item ) = @_;
+    my $code = *$item{CODE} or return;
+    return if ref $item eq 'SCALAR';
 
     my $source = _sub_package($code) or return;
 
@@ -273,13 +382,10 @@ sub _is_valid_method {
     
     unless ($is_valid) {
         foreach my $role (@{ $ALLOWED_BY{$source} }) {
-            return 1 if $target->DOES($role);
+            return $code if $target->DOES($role);
         }
-        return 1
-          if exists $ROLE_ALLOWS{$target} && $ROLE_ALLOWS{$target} eq $source;
     }
-    return $is_valid;
-
+    return $is_valid ? $code : ();
 }
 
 sub _sub_package {
@@ -301,22 +407,30 @@ sub _sub_package {
 }
 
 sub _load_role {
-    my ( $class, $role ) = @_;
+    my ( $class, $role, $version ) = @_;
+
+    $version ||= '';
+    my $stash = do { no strict 'refs'; \%{"${role}::"} };
+    if ( exists $stash->{requires} ) {
+        my $package = $role;
+        $package =~ s{::}{/}g;
+        $package .= ".pm";
+        if ( not exists $INC{$package} ) {
+
+            # embedded role, not a separate package
+            $INC{"$package"} = "added to inc by $class";
+        }
+    }
+    eval "use $role $version";
+    Carp::confess($@) if $@;
 
     return 1 if $IS_ROLE{$role};
-    my $stash = do { no strict 'refs'; \%{"${role}::"} };
-    unless ( keys %$stash ) {
-        ( my $filename = $role ) =~ s/::/\//g;
-        require "${filename}.pm";
-        no strict 'refs';
-    }
-    my $requires = $role->can('requires');
 
+    my $requires = $role->can('requires');
     if ( !$requires || $class ne _sub_package($requires) ) {
         Carp::confess(
             "Only roles defined with $class may be loaded with _load_role.  '$role' is not allowed.");
     }
-
     $IS_ROLE{$role} = 1;
     return 1;
 }
@@ -331,7 +445,7 @@ Role::Basic - Just roles. Nothing else.
 
 =head1 VERSION
 
-Version 0.0701
+Version 0.08
 
 =head1 SYNOPSIS
 
@@ -443,8 +557,27 @@ the following line to the package:
 
     use Role::Basic 'with';
 
-Just as with L<Moose>, you can have C<-alias> and list C<-excludes>.
+Just as with L<Moose>, you can have C<-alias>, C<-excludes>, and C<-version>.
 
+Unlike Moose, we also provide a C<-rename> target.  It combines C<-alias> and
+C<-excludes>. This code:
+
+    package My::Class;
+    use Role::Basic 'with';
+
+    with 'My::Role' => {
+        -rename => { foo => 'baz', bar => 'gorch' },
+    };
+
+Is identical to this code:
+
+    package My::Class;
+    use Role::Basic 'with';
+
+    with 'My::Role' => {
+        -alias    => { foo => 'baz', bar => 'gorch' },
+        -excludes => [qw/foo bar/],
+    };
 =head1 EXPORT
 
 Both roles and classes will receive the following methods:
@@ -474,6 +607,8 @@ Returns true if the class or role consumes a role of the given name:
     ...
  }
 
+Every role "DOES" itself.
+
 =back
 
 Further, if you're a role, you can also specify methods you require:
@@ -496,7 +631,6 @@ Further, if you're a role, you can also specify methods you require:
 
 In the example above, if C<Another::Role> has methods it requires, they will
 be added to the requirements of C<Some::Role>.
-
 
 =back
 

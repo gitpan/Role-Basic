@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 
-use Test::More tests => 12;
 use lib 'lib', 't/lib';
+use MyTests tests => 12;
 require Role::Basic;
 
 {
@@ -70,30 +70,30 @@ qr/Role 'My::Does::Basic' not overriding method 'conflict' in 'My::Bad::Override
 }
 
 {
-    eval <<'    END_PACKAGE';
     {
         package My::Conflict;
         use Role::Basic;
         sub conflict {};
     }
+    eval <<'    END_PACKAGE';
     package My::Bad::MethodConflicts;
     use Role::Basic 'with';
     with qw(My::Does::Basic My::Conflict);
     sub turbo_charger {}
     END_PACKAGE
     like $@,
-    qr/Due to method name conflicts in My::Does::Basic and My::Conflict, the method 'conflict' must be included or excluded in My::Bad::MethodConflicts/,
+    qr/Due to a method name conflict in roles 'My::Conflict' and 'My::Does::Basic', the method 'conflict' must be implemented or excluded by 'My::Bad::MethodConflicts'/,
       'Trying to use multiple roles with the same method should fail';
 }
 
 {
     local $ENV{PERL_ROLE_OVERRIDE_DIE} = 1;
-    eval <<'    END_PACKAGE';
     {
         package My::Conflict2;
         use Role::Basic;
         sub conflict {};
     }
+    eval <<'    END_PACKAGE';
     package My::Bad::MethodConflicts2;
     use Role::Basic 'with';
     with 'My::Does::Basic',
@@ -101,8 +101,8 @@ qr/Role 'My::Does::Basic' not overriding method 'conflict' in 'My::Bad::Override
     sub turbo_charger {}
     END_PACKAGE
     like $@,
-    qr/\QRole 'My::Conflict2' not overriding method 'turbo_charger' in 'My::Bad::MethodConflicts2'/,
-      'Trying to alias a conflicting method to an existing one in the package should fail if PERL_ROLE_OVERRIDE_DIE is set';
+    qr/\QCannot alias 'conflict' to 'turbo_charger' as a method of that name already exists in My::Bad::MethodConflicts2/,
+      'Trying to alias a conflicting method to an existing one in the package should fail';
 }
 
 {
@@ -140,7 +140,7 @@ qr/Role 'My::Does::Basic' not overriding method 'conflict' in 'My::Bad::Override
     with 'Role2';
     END
     like $@,
-    qr/'Role2' requires the method 'missing_method' to be implemented by 'My::Class::Missing1'/,
+    qr/'Role1|Role2' requires the method 'missing_method' to be implemented by 'My::Class::Missing1'/,
       'Roles composed from roles should propogate requirements upwards';
 }
 {

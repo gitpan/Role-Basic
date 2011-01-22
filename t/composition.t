@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 
-use Test::More tests => 27;
 use lib 'lib', 't/lib';
+use MyTests tests => 27;
 require Role::Basic;
 
 {
@@ -34,7 +34,8 @@ with qw(
 );
 sub turbo_charger {}
 END_PACKAGE
-ok !$@, 'We should be able to use two roles with the same requirements';
+ok !$@, 'We should be able to use two roles with the same requirements'
+    or die $@;
 
 {
 
@@ -108,10 +109,11 @@ ok !$object->DOES('My::Does::Basic1'),
         with 'Role::Which::Imports';
     }
     {
-       package Class::With::ImportingRole2;
-       use Role::Basic 'with';
-       with 'Role::WithImportsOnceRemoved';
-       sub new { bless {} => shift }
+        package Class::With::ImportingRole2;
+        use Role::Basic 'with';
+$ENV{DEBUG} = 1;
+        with 'Role::WithImportsOnceRemoved';
+        sub new { bless {} => shift }
     }
     ok my $o = Class::With::ImportingRole2->new,
         'We should be able to use roles which compose roles which import';
