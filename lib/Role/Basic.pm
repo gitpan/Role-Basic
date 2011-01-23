@@ -10,7 +10,7 @@ use Storable ();
 use Carp ();
 use Data::Dumper ();
 
-our $VERSION = '0.08';
+our $VERSION = '0.0801';
 
 # eventually clean these up
 my ( %IS_ROLE, %REQUIRED_BY, %HAS_ROLES, %ALLOWED_BY, %PROVIDES );
@@ -248,9 +248,10 @@ sub _add_role_methods_to_target {
     my $copied_modifiers = Storable::dclone($role_modifiers);
     my $role_name = $class->_get_role_name( $role, $copied_modifiers );
 
-    my $target_methods = $class->_get_methods($target);
-    my $is_loaded      = $PROVIDES{$role_name};
-    my $code_for       = $is_loaded || $class->_get_methods($role);
+    my $target_methods    = $class->_get_methods($target);
+    my $is_loaded         = $PROVIDES{$role_name};
+    my $code_for          = $is_loaded || $class->_get_methods($role);
+    my %original_code_for = %$code_for;
 
     delete $role_modifiers->{'-version'};
     my ( $is_excluded, $aliases ) =
@@ -259,13 +260,13 @@ sub _add_role_methods_to_target {
     my $stash = do { no strict 'refs'; \%{"${target}::"} };
     while ( my ( $old_method, $new_method ) = each %$aliases ) {
         if ( !$is_loaded ) {
-            if ( exists $code_for->{$new_method} ) {
+            if ( exists $code_for->{$new_method} && !$is_excluded->{$new_method} ) {
                 Carp::confess(
     "Cannot alias '$old_method' to existing method '$new_method' in $role"
                 );
             }
             else {
-                $code_for->{$new_method} = $code_for->{$old_method};
+                $code_for->{$new_method} = $original_code_for{$old_method};
             }
         }
 
@@ -277,11 +278,14 @@ sub _add_role_methods_to_target {
         }
     }
 
+    my %was_aliased = reverse %$aliases;
     foreach my $method ( keys %$code_for ) {
         if ( $is_excluded->{$method} ) {
-            delete $code_for->{$method};
-            $class->add_to_requirements( $target, $method );
-            next;
+            unless ($was_aliased{$method}) {
+                delete $code_for->{$method};
+                $class->add_to_requirements( $target, $method );
+                next;
+            }
         }
 
         if ( exists $target_methods->{$method} ) {
@@ -445,7 +449,7 @@ Role::Basic - Just roles. Nothing else.
 
 =head1 VERSION
 
-Version 0.08
+Version 0.0801
 
 =head1 SYNOPSIS
 
@@ -578,6 +582,7 @@ Is identical to this code:
         -alias    => { foo => 'baz', bar => 'gorch' },
         -excludes => [qw/foo bar/],
     };
+
 =head1 EXPORT
 
 Both roles and classes will receive the following methods:
