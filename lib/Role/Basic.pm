@@ -10,7 +10,7 @@ use Storable ();
 use Carp ();
 use Data::Dumper ();
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 # eventually clean these up
 my ( %IS_ROLE, %REQUIRED_BY, %HAS_ROLES, %ALLOWED_BY, %PROVIDES );
@@ -124,7 +124,7 @@ sub apply_roles_to_package {
         $class->_load_role( $role, $role_modifiers->{'-version'} );
 
         # XXX this is awful. Don't tell anyone I wrote this
-        my $role_methods = $class->_add_role_methods_to_target( 
+        my $role_methods = $class->_add_role_methods_to_target(
             $role,
             $target,
             $role_modifiers
@@ -369,7 +369,7 @@ sub _get_methods {
 
 sub _get_valid_method {
     my ( $target, $item ) = @_;
-    return if ref $item eq 'SCALAR';
+    return if ref $item;
     my $code = *$item{CODE} or return;
 
     my $source = _sub_package($code) or return;
@@ -383,7 +383,7 @@ sub _get_valid_method {
       ||
       # unless we're a role and they're composed from another role
       $IS_ROLE{$target} && $IS_ROLE{$source};
-    
+
     unless ($is_valid) {
         foreach my $role (@{ $ALLOWED_BY{$source} }) {
             return $code if $target->DOES($role);
@@ -449,7 +449,7 @@ Role::Basic - Just roles. Nothing else.
 
 =head1 VERSION
 
-Version 0.10
+Version 0.12
 
 =head1 SYNOPSIS
 
